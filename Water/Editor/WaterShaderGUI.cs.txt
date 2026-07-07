@@ -1,0 +1,157 @@
+using UnityEditor;
+using UnityEngine;
+
+public class WaterShaderGUI : ShaderGUI
+{
+    private static bool wavesOpen = true;
+    private static bool tessellationOpen = true;
+    private static bool outputOpen = true;
+    private static bool opticsOpen = true;
+    private static bool scatteringOpen = true;
+    private static bool foamOpen = false;
+    private static bool reflectionOpen = true;
+    private static bool causticsOpen = true;
+
+    private MaterialEditor editor;
+    private MaterialProperty[] properties;
+
+    public override void OnGUI(MaterialEditor materialEditor, MaterialProperty[] props)
+    {
+        editor = materialEditor;
+        properties = props;
+
+        EditorGUI.BeginChangeCheck();
+
+        DrawSection("Waves", ref wavesOpen, DrawWaves);
+        DrawSection("Tessellation", ref tessellationOpen, DrawTessellation);
+        DrawSection("Output Toggles", ref outputOpen, DrawOutputToggles);
+        DrawSection("Optics", ref opticsOpen, DrawOptics);
+        DrawSection("Scattering", ref scatteringOpen, DrawScattering);
+        DrawSection("Foam", ref foamOpen, DrawFoam);
+        DrawSection("Reflection", ref reflectionOpen, DrawReflection);
+        DrawSection("Caustics", ref causticsOpen, DrawCaustics);
+
+        if (EditorGUI.EndChangeCheck())
+        {
+            foreach (Object target in materialEditor.targets)
+            {
+                if (target is Material material)
+                {
+                    SetKeyword(material, "_FOAM_ON", material.GetFloat("_FoamOn") > 0.5f);
+                    SetKeyword(material, "_CAUSTICS_ON", material.GetFloat("_CausticsOn") > 0.5f);
+                }
+            }
+        }
+    }
+
+    private void DrawSection(string title, ref bool open, System.Action draw)
+    {
+        EditorGUILayout.Space(4f);
+        using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+        {
+            open = EditorGUILayout.Foldout(open, title, true, EditorStyles.foldoutHeader);
+            if (!open)
+            {
+                return;
+            }
+
+            EditorGUI.indentLevel++;
+            draw();
+            EditorGUI.indentLevel--;
+        }
+    }
+
+    private void DrawWaves()
+    {
+        DrawProperty("_WaveStrength", "Overall Strength");
+        DrawProperty("_WaveSpeed", "Overall Speed");
+        EditorGUILayout.Space(3f);
+
+        for (int i = 1; i <= 8; i++)
+        {
+            EditorGUILayout.LabelField("Wave " + i, EditorStyles.boldLabel);
+            EditorGUI.indentLevel++;
+            DrawProperty("_WaveDir" + i, "Direction / Steepness");
+            DrawProperty("_WaveLen" + i, "Length / Speed / Phase");
+            DrawProperty("_WaveAmp" + i, "Amplitude");
+            EditorGUI.indentLevel--;
+        }
+    }
+
+    private void DrawTessellation()
+    {
+        DrawProperty("_TessMax", "Max Tessellation");
+        DrawProperty("_TessMin", "Min Tessellation");
+        DrawProperty("_TessDist", "Tessellation Distance");
+    }
+
+    private void DrawOutputToggles()
+    {
+        DrawProperty("_ReflectionOn", "Reflection");
+        DrawProperty("_RefractionOn", "Refraction");
+        DrawProperty("_ScatteringOn", "Scattering");
+        DrawProperty("_TransmissionOn", "Transmission");
+        DrawProperty("_CausticsOn", "Underwater Caustics");
+    }
+
+    private void DrawOptics()
+    {
+        DrawProperty("_IOR", "Index of Refraction");
+        DrawProperty("_RefractionStrength", "Refraction Strength");
+        DrawProperty("_RefractionDepthFade", "Depth Edge Guard");
+        DrawProperty("_RefractionEdgeSoftness", "Edge Softness");
+        DrawProperty("_Roughness", "Roughness");
+        DrawProperty("_Specular", "Specular Strength");
+        DrawProperty("_FresnelPower", "Fresnel Power");
+    }
+
+    private void DrawScattering()
+    {
+        DrawProperty("_AbsorptionColor", "Absorption");
+        DrawProperty("_ScatterColor", "Scattering");
+        DrawProperty("_PhaseG", "HG Phase G");
+        DrawProperty("_RaySteps", "Ray March Steps");
+    }
+
+    private void DrawFoam()
+    {
+        DrawProperty("_FoamOn", "Enable Foam");
+        DrawProperty("_FoamColor", "Foam Color");
+        DrawProperty("_FoamDepth", "Depth Range");
+        DrawProperty("_FoamCrest", "Crest Threshold");
+    }
+
+    private void DrawReflection()
+    {
+        DrawProperty("_ReflectionStrength", "Reflection Strength");
+    }
+
+    private void DrawCaustics()
+    {
+        DrawProperty("_CausticsRT", "Caustics RT");
+        DrawProperty("_CausticsStrength", "Caustics Strength");
+    }
+
+    private void DrawProperty(string name, string label)
+    {
+        MaterialProperty property = FindProperty(name, properties, false);
+        if (property == null)
+        {
+            return;
+        }
+
+        editor.ShaderProperty(property, new GUIContent(label));
+    }
+
+    private static void SetKeyword(Material material, string keyword, bool enabled)
+    {
+        if (enabled)
+        {
+            material.EnableKeyword(keyword);
+        }
+        else
+        {
+            material.DisableKeyword(keyword);
+        }
+    }
+}

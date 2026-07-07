@@ -1,0 +1,250 @@
+// Caustics — Full-RT single dispatch per cascade (no tiles).
+// Pipeline: ClearAccum → AccumulatePhotons → ResolveCaustics → BlendTemporal
+
+#pragma kernel ClearAccum
+#pragma kernel AccumulatePhotons
+#pragma kernel ResolveCaustics
+#pragma kernel AtrousFirst
+#pragma kernel AtrousPass
+#pragma kernel BlendTemporal
+
+RWStructuredBuffer<int> _CausticAccum;  // accumulation buffer
+RWTexture2D<float4>  _CausticsRT;        // cascade output
+RWTexture2D<float4>  _TemporalOutputRT;
+Texture2D<float4>    _HistoryCausticsRT;
+
+// A-Trous ping-pong
+RWTexture2D<float4> _AtrousPing;
+RWTexture2D<float4> _AtrousPong;
+Texture2D<float4>   _AtrousSrc;
+int   _AtrousStepSize;
+float _AtrousEdgeThreshold;
+int   _AtrousKernelRadius;
+
+int    _Res;
+float  _CausticsTime;
+float  _MaxPhotons;
+float  _TemporalBlend;
+float  _CausticsContrast;
+
+float4 _WD1, _WD2, _WD3, _WD4, _WD5, _WD6, _WD7, _WD8;
+float4 _WL1, _WL2, _WL3, _WL4, _WL5, _WL6, _WL7, _WL8;
+float  _WA1, _WA2, _WA3, _WA4, _WA5, _WA6, _WA7, _WA8;
+float  _WaveStrength, _WaveSpeed;
+
+float4 _CascadeParams;  // (centerX, centerY, worldSize, unused)
+float  _WaterBaseHeight, _WaterDepth;
+float  _Intensity;
+float3 _LightDir;
+int    _ResolveBlurRadius;
+float  _RidgeBoost;
+
+float2 _CurrentAreaMin, _HistoryAreaMin, _AreaSize;
+
+float3 RefractWater(float3 L, float3 N, float eta)
+{
+    float NoL = dot(N, L);
+    float k = 1.0 - eta * eta * (1.0 - NoL * NoL);
+    if (k < 0.0) return float3(0, 0, 0);
+    return eta * L - (eta * NoL + sqrt(k)) * N;
+}
+
+void GerstnerNormal(float2 xz, float4 ds, float4 ls, float amp, inout float3 nMod)
+{
+    float2 D = normalize(ds.xy); float Q = saturate(ds.z);
+    float len = ls.x; float spd = ls.y; float phase = ls.z;
+    float A = amp * _WaveStrength;
+    if (A < 0.0001) return;
+    float k = 6.2831853 / max(len, 0.001);
+    float phi = k * dot(D, xz) - spd * k * _CausticsTime * _WaveSpeed + phase;
+    float sp = sin(phi); float cp = cos(phi); float ka = k * A;
+    nMod.x += ka * cp * D.x; nMod.z += ka * cp * D.y; nMod.y += ka * Q * sp;
+}
+
+float3 EvaluateWaterNormal(float2 xz)
+{
+    float3 nMod = float3(0, 0, 0);
+    GerstnerNormal(xz, _WD1, _WL1, _WA1, nMod);
+    GerstnerNormal(xz, _WD2, _WL2, _WA2, nMod);
+    GerstnerNormal(xz, _WD3, _WL3, _WA3, nMod);
+    GerstnerNormal(xz, _WD4, _WL4, _WA4, nMod);
+    GerstnerNormal(xz, _WD5, _WL5, _WA5, nMod);
+    GerstnerNormal(xz, _WD6, _WL6, _WA6, nMod);
+    GerstnerNormal(xz, _WD7, _WL7, _WA7, nMod);
+    GerstnerNormal(xz, _WD8, _WL8, _WA8, nMod);
+    return normalize(float3(-nMod.x, 1.0 - nMod.y, -nMod.z));
+}
+
+float EvaluateWaterHeight(float2 xz)
+{
+    float h = 0;
+    float2 D; float L, S, ph, A, k, phi;
+    #define H_WAVE(wd,wl,wa) \
+        D = normalize(wd.xy); L = wl.x; S = wl.y; ph = wl.z; A = wa * _WaveStrength; \
+        if (A >= 0.0001) { k = 6.2831853/max(L,0.001); \
+            phi = k*dot(D,xz) - S*k*_CausticsTime*_WaveSpeed + ph; h += A*sin(phi); }
+    H_WAVE(_WD1,_WL1,_WA1); H_WAVE(_WD2,_WL2,_WA2);
+    H_WAVE(_WD3,_WL3,_WA3); H_WAVE(_WD4,_WL4,_WA4);
+    H_WAVE(_WD5,_WL5,_WA5); H_WAVE(_WD6,_WL6,_WA6);
+    H_WAVE(_WD7,_WL7,_WA7); H_WAVE(_WD8,_WL8,_WA8);
+    #undef H_WAVE
+    return h;
+}
+
+// ================================================================
+// Pass 0: Clear accumulation RT
+// ================================================================
+[numthreads(8, 8, 1)]
+void ClearAccum(uint3 id : SV_DispatchThreadID)
+{
+    _CausticAccum[id.y * _Res + id.x] = 0;
+}
+
+// ================================================================
+// Pass 1: Accumulate — full cascade, one thread per pixel
+// ================================================================
+[numthreads(8, 8, 1)]
+void AccumulatePhotons(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_Res || id.y >= (uint)_Res) return;
+
+    float2 uv = (float2(id.xy) + 0.5) / float(_Res);
+    float2 xz = _CascadeParams.xy + (uv - 0.5) * _CascadeParams.z;
+
+    float3 waterN = EvaluateWaterNormal(xz);
+    float  waveH  = EvaluateWaterHeight(xz);
+    // _LightDir = surface→sun. Photon travels sun→surface: negate XZ, keep Y.
+    // Y stays positive: Snell eta*L - (eta*NoL+sqrt(k))*N auto-flips vertical.
+    float3 L = normalize(float3(-_LightDir.x, _LightDir.y, -_LightDir.z));
+    float3 L2 = RefractWater(L, waterN, 1.0 / 1.333);
+    if (dot(L2, L2) < 0.0001) return;
+
+    float actualDepth = _WaterDepth + waveH;
+    float t = max(actualDepth, 0.01) / max(abs(L2.y), 0.001);
+    float2 hitXZ = xz + L2.xz * t;
+
+    float2 hitUV = (hitXZ - (_CascadeParams.xy - 0.5 * _CascadeParams.z)) / _CascadeParams.z;
+    if (any(hitUV < 0.0) || any(hitUV > 1.0)) return;
+    int2 hitPx = int2(hitUV * float(_Res));
+    hitPx = clamp(hitPx, 0, _Res - 1);
+
+    int energy = (int)(_Intensity * 10000.0 + 0.5);
+    if (energy == 0) return;
+    InterlockedAdd(_CausticAccum[hitPx.y * _Res + hitPx.x], energy);
+}
+
+// ================================================================
+// Pass 2: Resolve — ridge detection from accumulation RT → cascade output
+// ================================================================
+[numthreads(8, 8, 1)]
+void ResolveCaustics(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_Res || id.y >= (uint)_Res) return;
+    int2 p = int2(id.xy);
+    int rr = clamp(_ResolveBlurRadius, 0, 3);
+
+    float sS = 0, sW = 0, wS = 0, wW = 0;
+    for (int oy = -4; oy <= 4; oy++)
+    {
+        for (int ox = -4; ox <= 4; ox++)
+        {
+            if (abs(ox) > 4 || abs(oy) > 4) continue;
+            int2 sp = clamp(p + int2(ox, oy), 0, _Res - 1);
+            float c = (float)_CausticAccum[sp.y * _Res + sp.x];
+            float2 d = float2(ox, oy);
+            float ww = exp(-dot(d,d)*0.14); wS += c*ww; wW += ww;
+            if (abs(ox) <= rr && abs(oy) <= rr)
+            { float sw = exp(-dot(d,d)*0.38); sS += c*sw; sW += sw; }
+        }
+    }
+    float sc = sS / max(sW, 0.001), wc = wS / max(wW, 0.001);
+    float ridge = max(sc - wc * 0.78, 0.0) * _RidgeBoost;
+    float b = (ridge + wc * 0.10) * 1e-4;
+    b /= max(_MaxPhotons * 1e-4, 0.0001);
+    b = pow(max(b, 0), max(_CausticsContrast, 0.001));
+    b = min(b, 8.0);
+    _CausticsRT[p] = float4(b, b, b, 1.0);
+}
+
+// ================================================================
+// Pass 3a: A-Trous kernel weight
+// ================================================================
+float AtrousW(int dx, int dy, int r)
+{
+    float s = r * 0.45 + 0.15;
+    return exp(-(dx * dx + dy * dy) / (2.0 * s * s));
+}
+
+// A-Trous first — CausticsRT → AtrousPing (step=1)
+[numthreads(8, 8, 1)]
+void AtrousFirst(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_Res || id.y >= (uint)_Res) return;
+    int2 p = int2(id.xy);
+    float4 center = _CausticsRT[p];
+    float cLum = max(center.r, max(center.g, center.b));
+    float4 sum = 0; float wsum = 0;
+    int r = clamp(_AtrousKernelRadius, 1, 3);
+    for (int dy = -r; dy <= r; dy++)
+    for (int dx = -r; dx <= r; dx++)
+    {
+        int2 sp = clamp(p + int2(dx, dy), int2(0,0), int2(_Res-1,_Res-1));
+        float4 sc = _CausticsRT[sp];
+        float sLum = max(sc.r, max(sc.g, sc.b));
+        float sw = AtrousW(dx, dy, r);
+        float diff = sLum - cLum;
+        float ew = exp(-diff * diff / max(cLum * _AtrousEdgeThreshold + 0.001, 0.0001));
+        sum += sc * sw * ew; wsum += sw * ew;
+    }
+    _AtrousPing[id.xy] = sum / max(wsum, 0.001);
+}
+
+// A-Trous pass — AtrousSrc → AtrousPong (step=N)
+[numthreads(8, 8, 1)]
+void AtrousPass(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_Res || id.y >= (uint)_Res) return;
+    int2 p = int2(id.xy);
+    float4 center = _AtrousSrc.Load(int3(p, 0));
+    float cLum = max(center.r, max(center.g, center.b));
+    float4 sum = 0; float wsum = 0;
+    int step = max(_AtrousStepSize, 1);
+    int r = clamp(_AtrousKernelRadius, 1, 3);
+    for (int dy = -r; dy <= r; dy++)
+    for (int dx = -r; dx <= r; dx++)
+    {
+        int2 sp = clamp(p + int2(dx, dy) * step, int2(0,0), int2(_Res-1,_Res-1));
+        float4 sc = _AtrousSrc.Load(int3(sp, 0));
+        float sLum = max(sc.r, max(sc.g, sc.b));
+        float sw = AtrousW(dx, dy, r);
+        float diff = sLum - cLum;
+        float ew = exp(-diff * diff / max(cLum * _AtrousEdgeThreshold + 0.001, 0.0001));
+        sum += sc * sw * ew; wsum += sw * ew;
+    }
+    _AtrousPong[id.xy] = sum / max(wsum, 0.001);
+}
+
+// ================================================================
+// Pass 4: Temporal blend — full cascade
+// ================================================================
+[numthreads(8, 8, 1)]
+void BlendTemporal(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_Res || id.y >= (uint)_Res) return;
+    int2 p = int2(id.xy);
+    float3 cur = _CausticsRT[p].rgb;
+
+    float2 uv = (float2(id.xy) + 0.5) / float(_Res);
+    float2 wxz = _CurrentAreaMin + uv * _AreaSize;
+    float2 huv = (wxz - _HistoryAreaMin) / _AreaSize;
+    int2 hp = int2(huv * float(_Res));
+    bool v = all(huv >= 0) && all(huv <= 1);
+
+    float3 hist = v ? _HistoryCausticsRT.Load(int3(clamp(hp, 0, _Res-1), 0)).rgb : cur;
+    float blend = saturate(_TemporalBlend);
+    float cL = max(cur.r, max(cur.g, cur.b));
+    float hL = max(hist.r, max(hist.g, hist.b));
+    float cap = max(cL * 2.6, 0.42);
+    hist *= hL > cap ? cap / max(hL, 0.0001) : 1.0;
+    _TemporalOutputRT[p] = float4(v ? lerp(cur, hist, blend) : cur, 1.0);
+}

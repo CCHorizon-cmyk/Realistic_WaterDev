@@ -1,0 +1,329 @@
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+
+class CascadeState
+{
+    public RenderTexture rt, historyRt, tempRt;
+    public RenderTexture atrousA, atrousB;
+    public ComputeBuffer accumBuf;
+    public Vector2 center, previousCenter;
+    public float worldSize;
+    public int rtRes;
+    public Vector2 effCenter;
+    public float   effSize;
+    public Vector2 AreaMin => center - new Vector2(worldSize, worldSize) * 0.5f;
+    public void Release()
+    {
+        if (rt)        { rt.Release();        CoreUtils.Destroy(rt);        rt = null; }
+        if (historyRt) { historyRt.Release(); CoreUtils.Destroy(historyRt); historyRt = null; }
+        if (tempRt)    { tempRt.Release();    CoreUtils.Destroy(tempRt);    tempRt = null; }
+        if (atrousA)   { atrousA.Release();   CoreUtils.Destroy(atrousA);   atrousA = null; }
+        if (atrousB)   { atrousB.Release();   CoreUtils.Destroy(atrousB);   atrousB = null; }
+        accumBuf?.Release(); accumBuf = null;
+    }
+}
+
+public class CausticsFeature : ScriptableRendererFeature
+{
+    public ComputeShader causticsCompute;
+
+    [Header("Cascade 0 — Near")]
+    public float c0WorldSize = 32f;
+    public int   c0Res = 1024;
+
+    [Header("Cascade 1 — Mid")]
+    public float c1WorldSize = 64f;
+    public int   c1Res = 512;
+
+    [Header("Cascade 2 — Far")]
+    public float c2WorldSize = 128f;
+    public int   c2Res = 256;
+
+    [Header("Cascade S — Static")]
+    public float   cSWorldSize = 256f;
+    public int     cSRes = 256;
+    public Vector2 cSCenter = Vector2.zero;
+
+    [Header("Wave 1-8")]
+    public WaveData w1 = new WaveData { dir = new Vector2(0.95f, 0.31f), steep = 0.28f, len = 10.0f, spd = 3.95f, phase = 0.0f, amp = 0.50f };
+    public WaveData w2 = new WaveData { dir = new Vector2(0.87f, 0.50f), steep = 0.25f, len = 6.5f, spd = 3.19f, phase = 1.5f, amp = 0.32f };
+    public WaveData w3 = new WaveData { dir = new Vector2(0.77f, 0.64f), steep = 0.28f, len = 4.0f, spd = 2.50f, phase = 2.8f, amp = 0.20f };
+    public WaveData w4 = new WaveData { dir = new Vector2(0.64f, 0.77f), steep = 0.22f, len = 2.6f, spd = 2.02f, phase = 4.2f, amp = 0.12f };
+    public WaveData w5 = new WaveData { dir = new Vector2(-0.20f, -0.98f), steep = 0.18f, len = 7.0f, spd = 3.31f, phase = 1.8f, amp = 0.08f };
+    public WaveData w6 = new WaveData { dir = new Vector2(0.50f, 0.87f), steep = 0.20f, len = 1.6f, spd = 1.58f, phase = 5.0f, amp = 0.06f };
+    public WaveData w7 = new WaveData { dir = new Vector2(0.34f, 0.94f), steep = 0.15f, len = 1.0f, spd = 1.25f, phase = 3.5f, amp = 0.03f };
+    public WaveData w8 = new WaveData { dir = new Vector2(-0.10f, -0.99f), steep = 0.12f, len = 0.5f, spd = 0.88f, phase = 6.0f, amp = 0.015f };
+    public float waveStrength = 1f, waveSpeed = 1f;
+
+    [Header("Photon")]
+    public float waterBaseHeight;
+    public float waterDepth = 5f;
+    [Range(0f, 6f)] public float intensity = 1.5f;
+
+    [Header("Resolve")]
+    [Range(100, 200000)] public int maxPhotons = 40000;
+    [Range(0, 2)] public int resolveBlurRadius = 1;
+    [Range(0f, 5f)] public float ridgeBoost = 0.5f;
+    [Range(0.25f, 3f)] public float contrast = 0.85f;
+
+    [Header("Temporal")]
+    public bool temporalAccumulation = true;
+    [Range(0f, 0.98f)] public float temporalBlend = 0.86f;
+
+    [Header("A-Trous Denoise")]
+    public bool atrousDenoise = false;
+    [Range(1, 4)] public int atrousIterations = 2;
+    [Range(1, 3)] public int atrousKernelRadius = 2;
+    [Range(0.5f, 20f)] public float atrousEdgeThreshold = 4.0f;
+
+    [System.Serializable]
+    public struct WaveData
+    {
+        public Vector2 dir;
+        [Range(0f, 1f)] public float steep;
+        public float len, spd, phase, amp;
+    }
+
+    CausticsPass m_Pass;
+    public override void Create()
+    {
+        DisposePass();
+        if (!causticsCompute) return;
+        m_Pass = new CausticsPass(causticsCompute, this);
+        m_Pass.renderPassEvent = RenderPassEvent.BeforeRenderingTransparents;
+    }
+    public override void AddRenderPasses(ScriptableRenderer r, ref RenderingData d)
+    { if (m_Pass != null) r.EnqueuePass(m_Pass); }
+    protected override void Dispose(bool d) { DisposePass(); }
+    void DisposePass() { m_Pass?.Dispose(); m_Pass = null; }
+
+    class CausticsPass : ScriptableRenderPass
+    {
+        static readonly int
+            AccumBufID      = Shader.PropertyToID("_CausticAccum"),
+            CausticsRTID    = Shader.PropertyToID("_CausticsRT"),
+            HistoryRTID     = Shader.PropertyToID("_HistoryCausticsRT"),
+            TemporalOutID   = Shader.PropertyToID("_TemporalOutputRT"),
+            ResID           = Shader.PropertyToID("_Res"),
+            CausticsTimeID  = Shader.PropertyToID("_CausticsTime"),
+            MaxPhotonsID    = Shader.PropertyToID("_MaxPhotons"),
+            TemporalBlendID = Shader.PropertyToID("_TemporalBlend"),
+            ContrastID      = Shader.PropertyToID("_CausticsContrast"),
+            IntensityID     = Shader.PropertyToID("_Intensity"),
+            LightDirID      = Shader.PropertyToID("_LightDir"),
+            RBlurRadiusID   = Shader.PropertyToID("_ResolveBlurRadius"),
+            RidgeBoostID    = Shader.PropertyToID("_RidgeBoost"),
+            WaterBaseHID    = Shader.PropertyToID("_WaterBaseHeight"),
+            WaterDepthID    = Shader.PropertyToID("_WaterDepth"),
+            CascadeParamsID = Shader.PropertyToID("_CascadeParams"),
+            AreaSizeID      = Shader.PropertyToID("_AreaSize"),
+            HistAreaMinID   = Shader.PropertyToID("_HistoryAreaMin"),
+            CurAreaMinID    = Shader.PropertyToID("_CurrentAreaMin"),
+            AtrousStepID    = Shader.PropertyToID("_AtrousStepSize"),
+            AtrousEdgeID    = Shader.PropertyToID("_AtrousEdgeThreshold"),
+            AtrousRadiusID  = Shader.PropertyToID("_AtrousKernelRadius"),
+            AtrousPingID    = Shader.PropertyToID("_AtrousPing"),
+            AtrousPongID    = Shader.PropertyToID("_AtrousPong"),
+            AtrousSrcID     = Shader.PropertyToID("_AtrousSrc");
+
+        readonly ComputeShader CS;
+        readonly CausticsFeature F;
+        CascadeState[] C;
+        int KClear, KAccum, KResolve, KTemporal, KAtrous1, KAtrousN;
+
+        public CausticsPass(ComputeShader cs, CausticsFeature f)
+        {
+            CS = cs; F = f;
+            KClear    = K("ClearAccum");
+            KAccum    = K("AccumulatePhotons");
+            KResolve  = K("ResolveCaustics");
+            KAtrous1  = K("AtrousFirst");
+            KAtrousN  = K("AtrousPass");
+            KTemporal = K("BlendTemporal");
+            C = new CascadeState[4];
+            Ensure();
+        }
+        int K(string n) => CS.HasKernel(n) ? CS.FindKernel(n) : -1;
+
+        public override void Execute(ScriptableRenderContext ctx, ref RenderingData data)
+        {
+            if (!CS || KClear < 0 || KAccum < 0 || KResolve < 0 || KTemporal < 0) return;
+            var cam = data.cameraData.camera;
+            var camXZ = cam ? new Vector2(cam.transform.position.x, cam.transform.position.z) : Vector2.zero;
+            var ld = LightDir(ref data);
+            UpdateCenters(camXZ);
+
+            var cmd = CommandBufferPool.Get("CausticsRT");
+            for (int ci = 0; ci < 4; ci++)
+            {
+                var cs = C[ci];
+                if (cs == null || !cs.rt || cs.accumBuf == null) continue;
+                SetParams(cmd, ld, cs);
+                int gx = Mathf.CeilToInt(cs.rtRes / 8f);
+
+                cmd.SetComputeBufferParam(CS, KClear, AccumBufID, cs.accumBuf);
+                cmd.DispatchCompute(CS, KClear, gx, gx, 1);
+
+                cmd.SetComputeBufferParam(CS, KAccum, AccumBufID, cs.accumBuf);
+                cmd.DispatchCompute(CS, KAccum, gx, gx, 1);
+
+                cmd.SetComputeBufferParam(CS, KResolve, AccumBufID, cs.accumBuf);
+                cmd.SetComputeTextureParam(CS, KResolve, CausticsRTID, cs.rt);
+                cmd.DispatchCompute(CS, KResolve, gx, gx, 1);
+
+                // A-Trous denoise (optional)
+                if (F.atrousDenoise && KAtrous1 >= 0 && KAtrousN >= 0 && cs.atrousA && cs.atrousB)
+                {
+                    cmd.SetComputeIntParam(CS, AtrousStepID, 1);
+                    cmd.SetComputeIntParam(CS, AtrousRadiusID, F.atrousKernelRadius);
+                    cmd.SetComputeFloatParam(CS, AtrousEdgeID, F.atrousEdgeThreshold);
+                    cmd.SetComputeTextureParam(CS, KAtrous1, CausticsRTID, cs.rt);
+                    cmd.SetComputeTextureParam(CS, KAtrous1, AtrousPingID, cs.atrousA);
+                    cmd.DispatchCompute(CS, KAtrous1, gx, gx, 1);
+                    var src = cs.atrousA; var dst = cs.atrousB;
+                    int iters = Mathf.Min(F.atrousIterations, 4);
+                    for (int i = 1; i < iters; i++)
+                    {
+                        cmd.SetComputeIntParam(CS, AtrousStepID, 1 << i);
+                        cmd.SetComputeIntParam(CS, AtrousRadiusID, F.atrousKernelRadius);
+                        cmd.SetComputeFloatParam(CS, AtrousEdgeID, F.atrousEdgeThreshold);
+                        cmd.SetComputeTextureParam(CS, KAtrousN, AtrousSrcID, src);
+                        cmd.SetComputeTextureParam(CS, KAtrousN, AtrousPongID, dst);
+                        cmd.DispatchCompute(CS, KAtrousN, gx, gx, 1);
+                        var t = src; src = dst; dst = t;
+                    }
+                    cmd.CopyTexture(src, cs.rt);
+                }
+            }
+
+            for (int ci = 0; ci < 4; ci++)
+            {
+                var cs = C[ci];
+                if (cs == null || !cs.rt || !cs.historyRt || !cs.tempRt) continue;
+                float blend = F.temporalAccumulation ? F.temporalBlend : 0f;
+                if (cs.previousCenter != cs.center) blend *= 0.3f;
+
+                var am = cs.AreaMin;
+                var sz = new Vector2(cs.worldSize, cs.worldSize);
+                cmd.SetComputeIntParam(CS, ResID, cs.rtRes);
+                cmd.SetComputeFloatParam(CS, TemporalBlendID, blend);
+                cmd.SetComputeVectorParam(CS, CurAreaMinID, am);
+                cmd.SetComputeVectorParam(CS, HistAreaMinID, am);
+                cmd.SetComputeVectorParam(CS, AreaSizeID, sz);
+                cmd.SetComputeBufferParam(CS, KTemporal, AccumBufID, cs.accumBuf);
+                cmd.SetComputeTextureParam(CS, KTemporal, CausticsRTID, cs.rt);
+                cmd.SetComputeTextureParam(CS, KTemporal, HistoryRTID, cs.historyRt);
+                cmd.SetComputeTextureParam(CS, KTemporal, TemporalOutID, cs.tempRt);
+                int gx = Mathf.CeilToInt(cs.rtRes / 8f);
+                cmd.DispatchCompute(CS, KTemporal, gx, gx, 1);
+                cmd.CopyTexture(cs.tempRt, cs.rt);
+                cmd.CopyTexture(cs.rt, cs.historyRt);
+                cs.previousCenter = cs.center;
+            }
+
+            SetCascadeGlobal(cmd, "_C0", C[0]);
+            SetCascadeGlobal(cmd, "_C1", C[1]);
+            SetCascadeGlobal(cmd, "_C2", C[2]);
+            SetCascadeGlobal(cmd, "_CS", C[3]);
+            ctx.ExecuteCommandBuffer(cmd);
+            CommandBufferPool.Release(cmd);
+        }
+
+        void UpdateCenters(Vector2 camXZ)
+        {
+            for (int i = 0; i < 4; i++) C[i].center = camXZ;
+        }
+
+        void SetParams(CommandBuffer cmd, Vector3 ld, CascadeState cs)
+        {
+            cmd.SetComputeIntParam(CS, ResID, cs.rtRes);
+            cmd.SetComputeFloatParam(CS, CausticsTimeID, Time.time);
+            cmd.SetComputeFloatParam(CS, ContrastID, F.contrast);
+            cmd.SetComputeFloatParam(CS, WaterBaseHID, F.waterBaseHeight);
+            cmd.SetComputeFloatParam(CS, WaterDepthID, F.waterDepth);
+            cmd.SetComputeFloatParam(CS, IntensityID, F.intensity);
+            cmd.SetComputeFloatParam(CS, MaxPhotonsID, Mathf.Max(1, F.maxPhotons));
+            cmd.SetComputeVectorParam(CS, LightDirID, ld);
+            cmd.SetComputeIntParam(CS, RBlurRadiusID, F.resolveBlurRadius);
+            cmd.SetComputeFloatParam(CS, RidgeBoostID, F.ridgeBoost);
+            // Oblique light: expand cascade to catch displaced photons
+            float expand = 1.0f + (1.0f - Mathf.Abs(ld.y)) * 2.0f;
+            cs.effCenter = cs.center + new Vector2(-ld.x, -ld.z) * F.waterDepth * 0.5f;
+            cs.effSize   = cs.worldSize * expand;
+            cmd.SetComputeVectorParam(CS, CascadeParamsID,
+                new Vector4(cs.effCenter.x, cs.effCenter.y, cs.effSize, 0));
+            cmd.SetComputeFloatParam(CS, Shader.PropertyToID("_WaveStrength"), F.waveStrength);
+            cmd.SetComputeFloatParam(CS, Shader.PropertyToID("_WaveSpeed"), F.waveSpeed);
+            W(cmd, "_WD1", "_WL1", "_WA1", F.w1); W(cmd, "_WD2", "_WL2", "_WA2", F.w2);
+            W(cmd, "_WD3", "_WL3", "_WA3", F.w3); W(cmd, "_WD4", "_WL4", "_WA4", F.w4);
+            W(cmd, "_WD5", "_WL5", "_WA5", F.w5); W(cmd, "_WD6", "_WL6", "_WA6", F.w6);
+            W(cmd, "_WD7", "_WL7", "_WA7", F.w7); W(cmd, "_WD8", "_WL8", "_WA8", F.w8);
+        }
+        void W(CommandBuffer cb, string dn, string ln, string an, CausticsFeature.WaveData w)
+        {
+            var d = w.dir.sqrMagnitude > 0.0001f ? w.dir.normalized : Vector2.right;
+            cb.SetComputeVectorParam(CS, Shader.PropertyToID(dn), new Vector4(d.x, d.y, w.steep, 0));
+            cb.SetComputeVectorParam(CS, Shader.PropertyToID(ln), new Vector4(w.len, w.spd, w.phase, 0));
+            cb.SetComputeFloatParam(CS, Shader.PropertyToID(an), w.amp);
+        }
+
+        static Vector3 LightDir(ref RenderingData d)
+        {
+            var vl = d.lightData.visibleLights;
+            int mi = d.lightData.mainLightIndex;
+            if (vl.Length > 0 && mi >= 0)
+                return -((Vector3)vl[mi].localToWorldMatrix.GetColumn(2)).normalized;
+            return new Vector3(-0.5f, 0.8f, -0.3f).normalized;
+        }
+
+        void Ensure()
+        {
+            if (KClear < 0 || KAccum < 0) return;
+            Build(0, F.c0WorldSize, F.c0Res);
+            Build(1, F.c1WorldSize, F.c1Res);
+            Build(2, F.c2WorldSize, F.c2Res);
+            Build(3, F.cSWorldSize, F.cSRes);
+        }
+
+        void Build(int idx, float ws, int res)
+        {
+            C[idx]?.Release();
+            var cs = new CascadeState
+            {
+                worldSize = ws, rtRes = res,
+                center = idx < 3 ? Vector2.zero : F.cSCenter,
+                previousCenter = idx < 3 ? new Vector2(-9999f, -9999f) : F.cSCenter,
+            };
+            var desc = new RenderTextureDescriptor(res, res, RenderTextureFormat.ARGBHalf, 0)
+            { useMipMap = false, enableRandomWrite = true, depthBufferBits = 0 };
+            cs.rt        = MkRT(desc, $"C{idx}Out");
+            cs.historyRt = MkRT(desc, $"C{idx}Hist");
+            cs.tempRt    = MkRT(desc, $"C{idx}Tmp");
+            cs.atrousA   = MkRT(desc, $"C{idx}AtA");
+            cs.atrousB   = MkRT(desc, $"C{idx}AtB");
+            cs.accumBuf  = new ComputeBuffer(res * res, sizeof(int));
+            cs.accumBuf.SetData(new int[res * res]);
+            C[idx] = cs;
+        }
+
+        static RenderTexture MkRT(RenderTextureDescriptor d, string n)
+        {
+            var r = new RenderTexture(d) { name = n, hideFlags = HideFlags.HideAndDontSave };
+            r.Create(); return r;
+        }
+
+        void SetCascadeGlobal(CommandBuffer c, string pfx, CascadeState cs)
+        {
+            if (cs == null || !cs.rt) return;
+            c.SetGlobalTexture($"{pfx}Tex", cs.rt);
+            c.SetGlobalVector($"{pfx}Center", cs.effCenter);
+            c.SetGlobalVector($"{pfx}Size", new Vector4(cs.effSize, cs.effSize, 0, 0));
+        }
+
+        public void Dispose()
+        {
+            if (C != null) foreach (var c in C) c?.Release();
+        }
+    }
+}
